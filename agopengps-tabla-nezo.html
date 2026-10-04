@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="hu"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgOpenGPS táblanézegető</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;font:14px system-ui,sans-serif;color:#1d2a1f}
+#app{display:flex;height:100%}
+#side{width:310px;display:flex;flex-direction:column;background:#f4f6f1;border-right:1px solid #cfd6c8;z-index:2}
+#side h1{font-size:16px;margin:0;padding:12px 14px 4px}
+#side p.s{margin:0;padding:0 14px 8px;color:#5b6b5d;font-size:12px}
+.btn{display:block;margin:4px 14px;padding:9px;border:0;border-radius:6px;background:#2f6b3a;color:#fff;font-weight:600;text-align:center;cursor:pointer}
+.btn.alt{background:#e2e8dc;color:#1d2a1f}
+#q{margin:6px 14px;padding:7px;border:1px solid #c3cbbb;border-radius:6px;width:calc(100% - 28px)}
+#cats{padding:2px 14px 6px;display:flex;flex-wrap:wrap;gap:4px 10px;font-size:12px}
+#cats label{display:flex;align-items:center;gap:4px;cursor:pointer}
+#cats i{width:10px;height:10px;border-radius:2px;display:inline-block}
+#list{flex:1;overflow:auto;border-top:1px solid #dde3d6}
+.f{padding:8px 14px;border-bottom:1px solid #e6ebe0;cursor:pointer}
+.f:hover{background:#e8eee2}.f.sel{background:#d5e6cf}
+.f b{display:block}.f span{font-size:12px;color:#5b6b5d}
+#stat{padding:8px 14px;font-size:12px;color:#5b6b5d;border-top:1px solid #dde3d6}
+#map{flex:1}
+#drop{position:absolute;inset:0;background:#2f6b3acc;color:#fff;font-size:22px;display:none;align-items:center;justify-content:center;z-index:999}
+.lbl{background:#fffd;border:0;box-shadow:none;font-weight:600;font-size:11px;padding:1px 4px}
+.nolbl .lbl{display:none}
+@media(max-width:700px){#app{flex-direction:column}#side{width:100%;height:42%}}
+</style></head><body>
+<div id="app">
+ <div id="side">
+  <h1>🚜 AgOpenGPS táblanézegető</h1>
+  <p class="s">KML, KMZ, ISOXML TASKDATA.xml vagy táblákat tartalmazó ZIP megnyitása</p>
+  <label class="btn">Fájlok megnyitása…<input id="fi" type="file" multiple accept=".kml,.kmz,.xml,.zip" hidden></label>
+  <button class="btn alt" id="fit">Ráközelítés az összes táblára</button>
+  <input id="q" placeholder="Tábla keresése…">
+  <div id="cats"></div>
+  <div id="list"></div>
+  <div id="stat">Nincs betöltött fájl</div>
+ </div>
+ <div id="map"></div>
+</div>
+<div id="drop">Húzd ide a fájlokat</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+const CATS={boundary:['Határ','#ffb300'],ab:['AB vonalak','#1e88e5'],curve:['Görbék','#43a047'],path:['Rögzített útvonal','#8e24aa'],flag:['Zászlók','#e53935'],other:['Egyéb','#607d8b']};
+const map=L.map('map',{preferCanvas:true}).setView([47,19],6);
+const osm=L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
+const sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Esri World Imagery'}).addTo(map);
+L.control.layers({'Műhold':sat,'Utcatérkép':osm}).addTo(map);
+L.control.scale().addTo(map);
+const fields=new Map(); const on={}; let selected=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num=s=>parseFloat(String(s).replace(',','.'));
+
+// category toggles
+for(const k in CATS){on[k]=true;
+ const l=document.createElement('label');
+ l.innerHTML=`<input type="checkbox" checked><i style="background:${CATS[k][1]}"></i>${CATS[k][0]}`;
+ l.firstChild.onchange=e=>{on[k]=e.target.checked;refreshVis()};
+ $('cats').appendChild(l);}
+function refreshVis(){for(const f of fields.values())for(const it of f.items){
+ const show=on[it.cat]; if(show&&!map.hasLayer(it.layer))it.layer.addTo(map); if(!show&&map.hasLayer(it.layer))map.removeLayer(it.layer);}}
+
+function areaHa(ll){ // equirectangular shoelace
+ if(ll.length<3)return 0; const la0=ll[0][0]*Math.PI/180,R=6371008.8; let a=0;
+ const p=ll.map(c=>[c[1]*Math.PI/180*Math.cos(la0)*R,c[0]*Math.PI/180*R]);
+ for(let i=0;i<p.length;i++){const j=(i+1)%p.length;a+=p[i][0]*p[j][1]-p[j][0]*p[i][1];}
+ return Math.abs(a)/2/10000;}
+
+function getField(n){let f=fields.get(n);if(!f){f={name:n,items:[],bounds:null,ha:0};fields.set(n,f);}return f;}
+function addItem(fname,cat,lls,name){ // lls: array of [lat,lon]
+ if(!lls.length)return; const f=getField(fname),col=CATS[cat][1]; let layer;
+ if(cat==='boundary'&&lls.length>2){layer=L.polygon(lls,{color:col,weight:3,fillColor:col,fillOpacity:.15});
+   layer.bindTooltip(fname,{permanent:true,direction:'center',className:'lbl'}); f.ha+=areaHa(lls);}
+ else if(lls.length===1){layer=L.circleMarker(lls[0],{radius:6,color:'#fff',weight:1.5,fillColor:col,fillOpacity:1});}
+ else layer=L.polyline(lls,{color:col,weight:cat==='path'?2:3,opacity:cat==='path'?.6:.9,dashArray:cat==='ab'?'8 6':null});
+ layer.bindPopup(`<b>${esc(fname)}</b><br>${CATS[cat][0]}${name?': '+esc(name):''}`);
+ f.items.push({cat,layer}); const b=L.latLngBounds(lls); f.bounds=f.bounds?f.bounds.extend(b):b;}
+
+// ---- KML ----
+const nm=e=>{for(const c of e.children)if(c.nodeName==='name')return c.textContent.trim();return''};
+const coords=e=>e.textContent.trim().split(/\s+/).map(t=>t.split(',').map(Number)).filter(a=>a.length>=2&&!isNaN(a[0])&&!isNaN(a[1])).map(a=>[a[1],a[0]]);
+const catOf=(n,tag)=>{n=n.toLowerCase();
+ if(n.includes('boundar'))return'boundary'; if(n.includes('curve'))return'curve'; if(n.includes('ab'))return'ab';
+ if(n.includes('flag')||tag==='Point')return'flag'; if(n.includes('path')||n.includes('track'))return'path';
+ return tag==='Polygon'?'boundary':'other';};
+function loadKML(txt,fallback){
+ const d=new DOMParser().parseFromString(txt,'text/xml');
+ for(const pm of d.getElementsByTagName('Placemark')){
+  const fol=[];for(let p=pm.parentNode;p&&p.nodeName==='Folder';p=p.parentNode)fol.push(nm(p));
+  const cf=fol[0]||'', fname=fol[1]||nm(d.documentElement.getElementsByTagName('Document')[0]||d.documentElement)||fallback;
+  const name=nm(pm);
+  for(const tag of ['Polygon','LineString','Point']){
+   for(const g of pm.getElementsByTagName(tag)){
+    const c=g.getElementsByTagName('coordinates')[0]; if(!c)continue;
+    addItem(fol.length>1?fname:(fol[0]||fallback),catOf(cf,tag),coords(c),name);}}}}
+
+// ---- ISOXML ----
+function loadISO(txt,fallback){
+ const d=new DOMParser().parseFromString(txt,'text/xml');
+ for(const pfd of d.getElementsByTagName('PFD')){
+  const fname=pfd.getAttribute('C')||fallback;
+  for(const lsg of pfd.getElementsByTagName('LSG')){
+   const pts=[...lsg.getElementsByTagName('PNT')].map(p=>[num(p.getAttribute('C')),num(p.getAttribute('D'))]).filter(a=>!isNaN(a[0])&&!isNaN(a[1]));
+   if(!pts.length)continue;
+   let gpn=lsg.parentNode;while(gpn&&gpn.nodeName!=='GPN'&&gpn.nodeName!=='PFD')gpn=gpn.parentNode;
+   const t=lsg.getAttribute('A'); let cat='other',name='';
+   if(t==='1')cat='boundary';
+   else if(gpn&&gpn.nodeName==='GPN'){name=gpn.getAttribute('B')||'';cat=['1','2'].includes(gpn.getAttribute('C'))?'ab':'curve';}
+   else if(pts.length===1)cat='flag'; else if(t==='5')cat=pts.length===2?'ab':'curve';
+   addItem(fname,cat,pts,name);}}}
+
+// ---- file handling ----
+async function handle(file){
+ const n=file.name,l=n.toLowerCase();
+ if(l.endsWith('.zip')||l.endsWith('.kmz')){
+  const z=await JSZip.loadAsync(file); const ents=Object.values(z.files).filter(e=>!e.dir);
+  const kml=ents.filter(e=>/\.kml$/i.test(e.name)), iso=ents.filter(e=>/taskdata\.xml$/i.test(e.name));
+  let use=kml.length?kml:iso;
+  if(!kml.length&&iso.length>1){const best=iso.filter(e=>/\/v4\//i.test(e.name));if(best.length)use=best;} // avoid v3+v4 duplicates
+  for(const e of use){const t=await e.async('string');const fb=e.name.split('/').slice(-2)[0].replace(/\.\w+$/,'')||n;
+   /\.kml$/i.test(e.name)?loadKML(t,fb):loadISO(t,fb);}
+ } else {const t=await file.text(); /<kml[\s>]/i.test(t)?loadKML(t,n.replace(/\.\w+$/,'')):loadISO(t,n.replace(/\.\w+$/,''));}
+}
+async function openFiles(fs){
+ $('stat').textContent='Betöltés…';
+ for(const f of fs){try{await handle(f)}catch(e){console.error(e);alert('Nem olvasható: '+f.name+': '+e.message)}}
+ refreshVis(); render(); fitAll();}
+$('fi').onchange=e=>{openFiles([...e.target.files]);e.target.value=''};
+let dc=0;
+addEventListener('dragenter',e=>{e.preventDefault();dc++;$('drop').style.display='flex'});
+addEventListener('dragleave',e=>{if(--dc<=0){dc=0;$('drop').style.display='none'}});
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',e=>{e.preventDefault();dc=0;$('drop').style.display='none';openFiles([...e.dataTransfer.files])});
+
+// ---- UI ----
+function fitAll(){let b=null;for(const f of fields.values())if(f.bounds)b=b?b.extend(f.bounds):L.latLngBounds(f.bounds.getSouthWest(),f.bounds.getNorthEast());
+ if(b)map.fitBounds(b,{padding:[30,30]});}
+$('fit').onclick=fitAll;
+$('q').oninput=render;
+function select(f){selected=f.name;
+ for(const g of fields.values())for(const it of g.items)if(it.cat==='boundary'&&it.layer.setStyle)it.layer.setStyle({weight:g===f?5:3,fillOpacity:g===f?.3:.15});
+ if(f.bounds)map.fitBounds(f.bounds,{padding:[40,40],maxZoom:18}); render();}
+function render(){
+ const q=$('q').value.toLowerCase(),box=$('list');box.innerHTML='';
+ const arr=[...fields.values()].sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+ let tot=0;
+ for(const f of arr){tot+=f.ha; if(q&&!f.name.toLowerCase().includes(q))continue;
+  const d=document.createElement('div');d.className='f'+(f.name===selected?' sel':'');
+  const n=f.items.filter(i=>i.cat==='ab'||i.cat==='curve').length;
+  d.innerHTML=`<b>${esc(f.name)}</b><span>${f.ha?f.ha.toFixed(2)+' ha · ':''}${n} vezetővonal</span>`;
+  d.onclick=()=>select(f);box.appendChild(d);}
+ $('stat').textContent=fields.size?`${fields.size} tábla · ${tot.toFixed(1)} ha összesen`:'Nincs betöltött fájl';}
+const lbl=()=>$('map').classList.toggle('nolbl',map.getZoom()<13);
+map.on('zoomend',lbl);lbl();
+</script></body></html>
