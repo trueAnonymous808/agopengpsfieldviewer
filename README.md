@@ -74,7 +74,3 @@ Items with the same field name from different files are merged into one entry.
 ## Contributing
 
 Issues and pull requests are welcome. Sample files from other guidance systems that fail to load are especially useful for improving the parsers.
-
-## License
-
-Choose a license for your repository (for example MIT) and add a `LICENSE` file.
